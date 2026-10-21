@@ -1,43 +1,85 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
+
 from app.api.auth_routes import router as auth_router
-from app.api.alert_routes import router as alert_router
+from app.api.chat_routes import router as chat_router
 from app.api.sop_routes import router as sop_router
-from app.api.triage_routes import router as triage_router
-from app.api.audit_routes import router as audit_router
+from app.api.ticket_routes import router as ticket_router
+from app.config import settings
+from app.db import SessionLocal, engine, init_db
+from app.services.auth_service import seed_default_users
+from app.services.embedding_service import embedding_service
+from app.services.rag_engine import soc_agent
+from app.services.sop_manager import sop_manager
+from app.services.ticket_service import ticket_service
+from app.services.vector_store import vector_store
+
+
+def _seed() -> None:
+    init_db()
+    db = SessionLocal()
+    try:
+        seed_default_users(db)
+        sop_manager.initialize_default_sops(db)
+        ticket_service.seed_initial_tickets(db)
+        vector_store.bootstrap(sop_manager.load_all_chunks(db))
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _seed()
+    embedding_service.warmup()
+
+    provider = (settings.LLM_PROVIDER or "auto").strip().lower()
+    if provider == "auto":
+        if settings.OPENAI_API_KEY.strip():
+            provider = "openai"
+        elif settings.NVIDIA_API_KEY.strip():
+            provider = "nim"
+        else:
+            provider = "none"
+    print(f"Database engine   : {engine.url.render_as_string(hide_password=True)}")
+    print(f"Vector index      : {vector_store.size} SOP chunks in FAISS")
+    print(f"Embedding model   : {settings.EMBEDDING_MODEL} (loaded once per process)")
+    print(f"LLM provider      : {provider}")
+    if provider == "none":
+        print("LLM provider      : none configured -> deterministic local synthesis")
+    yield
+
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="SOP-guided cybersecurity incident response assistant leveraging RAG and LLMs with cryptographic audit trails.",
-    version="1.0.0"
+    description=(
+        "Tool-using SOC agent for incident investigation. The agent can search "
+        "approved SOP excerpts and return grounded recommendations with citations."
+    ),
+    version=settings.VERSION,
+    lifespan=lifespan,
 )
 
-# Enable CORS for frontend development
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# Register API routers under /api/v1
 app.include_router(auth_router, prefix=settings.API_V1_STR)
-app.include_router(alert_router, prefix=settings.API_V1_STR)
+app.include_router(chat_router, prefix=settings.API_V1_STR)
+app.include_router(ticket_router, prefix=settings.API_V1_STR)
 app.include_router(sop_router, prefix=settings.API_V1_STR)
-app.include_router(triage_router, prefix=settings.API_V1_STR)
-app.include_router(audit_router, prefix=settings.API_V1_STR)
 
-@app.get("/")
-def health_check():
+
+@app.get("/health", tags=["Health"])
+def health() -> dict:
     return {
-        "status": "online",
-        "service": settings.PROJECT_NAME,
-        "api_docs": "/docs",
-        "version": "1.0.0"
+        "status": "ok",
+        "version": settings.VERSION,
+        "vector_chunks": vector_store.size,
+        "llm_provider_configured": soc_agent.llm is not None,
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)

@@ -1,150 +1,155 @@
 import json
 import os
-import re
-import math
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
+
 from app.config import settings
-from app.models.schemas import SOPChunk
+from app.services.embedding_service import embedding_service
+
 
 class VectorStore:
-    def __init__(self, storage_path: str = settings.INDEX_FILE):
-        self.storage_path = storage_path
-        self.chunks: List[SOPChunk] = []
-        self.vocabulary: Dict[str, int] = {}
-        self.idf: Dict[str, float] = {}
-        self.chunk_vectors: List[np.ndarray] = []
-        self.load()
+    """FAISS IndexFlatIP on L2-normalized vectors (cosine similarity).
 
-    def _tokenize(self, text: str) -> List[str]:
-        # Lowercase, alphanumeric words, cybersecurity-relevant tokens (IPs, domains, flags)
-        tokens = re.findall(r'[a-zA-Z0-9_\-\.]{2,}', text.lower())
-        return tokens
+    Persisted to disk but only trusted when its on-disk chunk-id ordering still
+    matches the DB; otherwise it is rebuilt (DB is source of truth).
+    """
 
-    def _build_tfidf_vector(self, text: str) -> np.ndarray:
-        tokens = self._tokenize(text)
-        if not self.vocabulary:
-            return np.zeros(1)
-        
-        vec = np.zeros(len(self.vocabulary), dtype=np.float32)
-        tf: Dict[str, int] = {}
-        for t in tokens:
-            tf[t] = tf.get(t, 0) + 1
-        
-        doc_len = max(len(tokens), 1)
-        for term, count in tf.items():
-            if term in self.vocabulary:
-                idx = self.vocabulary[term]
-                # Log-scaled TF * IDF
-                tf_val = (1 + math.log(count)) / doc_len
-                idf_val = self.idf.get(term, 1.0)
-                vec[idx] = tf_val * idf_val
-        
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec
+    def __init__(self) -> None:
+        self._index = None
+        self._chunk_ids: List[str] = []   # parallel to index rows
+        self._meta: List[dict] = []        # {chunk_id, sop_id, section, content}
+        self._dim: Optional[int] = None
 
-    def reindex(self):
-        """Recompute vocabulary, IDF, and TF-IDF vectors across all SOP chunks."""
-        if not self.chunks:
-            self.vocabulary = {}
-            self.idf = {}
-            self.chunk_vectors = []
+    # ------------------------------------------------------------------ init
+    def _ensure_index(self):
+        if self._index is None:
+            import faiss
+
+            self._dim = embedding_service.dimension
+            self._index = faiss.IndexFlatIP(self._dim)
+
+    def _persist(self) -> None:
+        import faiss
+
+        if self._index is None:
+            return
+        os.makedirs(settings.DATA_DIR, exist_ok=True)
+        faiss.write_index(self._index, settings.FAISS_INDEX_FILE)
+        meta_path = settings.FAISS_INDEX_FILE + ".meta.json"
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"chunk_ids": self._chunk_ids, "meta": self._meta}, fh
+            )
+
+    def _load(self) -> bool:
+        import faiss
+
+        if not os.path.exists(settings.FAISS_INDEX_FILE):
+            return False
+        try:
+            self._index = faiss.read_index(settings.FAISS_INDEX_FILE)
+            meta_path = settings.FAISS_INDEX_FILE + ".meta.json"
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self._chunk_ids = list(data.get("chunk_ids", []))
+            self._meta = list(data.get("meta", []))
+            self._dim = self._index.d
+            return True
+        except Exception:
+            self._index = None
+            self._chunk_ids = []
+            self._meta = []
+            return False
+
+    def _rebuild(self, chunks: List[Tuple[str, str, str, str]]) -> None:
+        """chunks: [(chunk_id, sop_id, section, content), ...]"""
+        import faiss
+
+        self._ensure_index()
+        self._index.reset()
+        self._chunk_ids = []
+        self._meta = []
+
+        if not chunks:
             return
 
-        # 1. Build vocabulary & document frequency
-        df: Dict[str, int] = {}
-        all_doc_tokens = []
-        for chunk in self.chunks:
-            full_text = f"{chunk.title} {chunk.section} {chunk.content} {' '.join(chunk.keywords)}"
-            tokens = set(self._tokenize(full_text))
-            all_doc_tokens.append(tokens)
-            for t in tokens:
-                df[t] = df.get(t, 0) + 1
+        texts = [c[3] for c in chunks]
+        vectors = embedding_service.embed(texts, normalize=True)
+        self._index.add(vectors)
+        for cid, sop_id, section, content in chunks:
+            self._chunk_ids.append(cid)
+            self._meta.append(
+                {"chunk_id": cid, "sop_id": sop_id, "section": section, "content": content}
+            )
+        self._persist()
 
-        # Keep terms appearing in at least 1 chunk
-        self.vocabulary = {term: idx for idx, term in enumerate(sorted(df.keys()))}
-        n_docs = len(self.chunks)
-        self.idf = {term: math.log((n_docs + 1) / (count + 1)) + 1.0 for term, count in df.items()}
+    # ------------------------------------------------------------------ API
+    def bootstrap(self, chunks: List[Tuple[str, str, str, str]]) -> None:
+        """Call at startup. Loads disk index if valid, else rebuilds from DB."""
+        loaded = self._load()
+        if loaded and len(self._chunk_ids) == len(chunks):
+            # Verify ordering matches DB exactly.
+            disk_ids = list(self._chunk_ids)
+            db_ids = [c[0] for c in chunks]
+            if disk_ids == db_ids:
+                return  # on-disk index is fresh
+        self._rebuild(chunks)
 
-        # 2. Vectorize all chunks
-        self.chunk_vectors = []
-        for chunk in self.chunks:
-            full_text = f"{chunk.title} {chunk.section} {chunk.content} {' '.join(chunk.keywords)}"
-            vec = self._build_tfidf_vector(full_text)
-            self.chunk_vectors.append(vec)
+    def add_chunks(self, chunks: List[Tuple[str, str, str, str]]) -> None:
+        """Incrementally append new chunks (used while seeding SOPs)."""
+        self._ensure_index()
+        if not chunks:
+            return
+        texts = [c[3] for c in chunks]
+        vectors = embedding_service.embed(texts, normalize=True)
+        self._index.add(vectors)
+        for cid, sop_id, section, content in chunks:
+            self._chunk_ids.append(cid)
+            self._meta.append(
+                {"chunk_id": cid, "sop_id": sop_id, "section": section, "content": content}
+            )
+        self._persist()
 
-        self.save()
+    def remove_by_sop_id(self, sop_id: str) -> None:
+        if self._index is None:
+            return
+        keep = [
+            (cid, m)
+            for cid, m in zip(self._chunk_ids, self._meta)
+            if m.get("sop_id") != sop_id
+        ]
+        self._chunk_ids = [c[0] for c in keep]
+        self._meta = [c[1] for c in keep]
+        if keep:
+            texts = [m["content"] for m in self._meta]
+            vectors = embedding_service.embed(texts, normalize=True)
+            self._index.reset()
+            self._index.add(vectors)
+        else:
+            self._index.reset()
+        self._persist()
 
-    def add_chunks(self, new_chunks: List[SOPChunk]):
-        # Deduplicate by chunk_id
-        existing_ids = {c.chunk_id for c in self.chunks}
-        for chunk in new_chunks:
-            if chunk.chunk_id in existing_ids:
-                self.chunks = [c for c in self.chunks if c.chunk_id != chunk.chunk_id]
-            self.chunks.append(chunk)
-        self.reindex()
-
-    def remove_by_sop_id(self, sop_id: str):
-        self.chunks = [c for c in self.chunks if c.sop_id != sop_id]
-        self.reindex()
-
-    def search(self, query: str, top_k: int = 4, threshold: float = 0.05) -> List[Tuple[SOPChunk, float]]:
-        """Retrieve top-k relevant chunks based on cosine similarity."""
-        if not self.chunks or not self.chunk_vectors:
+    def search(
+        self, query: str, top_k: int = 4, threshold: float = 0.0
+    ) -> List[Tuple[Any, float]]:
+        """Returns [(chunk_meta_dict, score), ...] sorted by score desc."""
+        if self._index is None or self._index.ntotal == 0:
             return []
-
-        query_vec = self._build_tfidf_vector(query)
-        q_norm = np.linalg.norm(query_vec)
-        if q_norm == 0:
-            # Fallback keyword match
-            q_terms = set(self._tokenize(query))
-            scored = []
-            for chunk in self.chunks:
-                text_terms = set(self._tokenize(f"{chunk.title} {chunk.content}"))
-                overlap = len(q_terms.intersection(text_terms))
-                score = overlap / max(len(q_terms), 1)
-                scored.append((chunk, score))
-            scored.sort(key=lambda x: x[1], reverse=True)
-            return [(c, s) for c, s in scored[:top_k] if s > 0]
-
-        scores = []
-        for i, doc_vec in enumerate(self.chunk_vectors):
-            if doc_vec.shape[0] != query_vec.shape[0]:
+        q = embedding_service.embed_query(query).reshape(1, -1)
+        scores, idxs = self._index.search(q, min(top_k, self._index.ntotal))
+        results: List[Tuple[Any, float]] = []
+        for score, idx in zip(scores[0], idxs[0]):
+            if idx == -1:
                 continue
-            cos_sim = float(np.dot(query_vec, doc_vec))
-            scores.append((self.chunks[i], cos_sim))
+            if score < threshold:
+                continue
+            results.append((self._meta[idx], float(score)))
+        return results
 
-        scores.sort(key=lambda x: x[1], reverse=True)
-        results = [item for item in scores if item[1] >= threshold]
-        return results[:top_k]
+    @property
+    def size(self) -> int:
+        return self._index.ntotal if self._index is not None else 0
 
-    def save(self):
-        data = {
-            "chunks": [c.model_dump() for c in self.chunks],
-            "vocabulary": self.vocabulary,
-            "idf": self.idf
-        }
-        with open(self.storage_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
-    def load(self):
-        if os.path.exists(self.storage_path):
-            try:
-                with open(self.storage_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.chunks = [SOPChunk(**c) for c in data.get("chunks", [])]
-                    self.vocabulary = data.get("vocabulary", {})
-                    self.idf = data.get("idf", {})
-                
-                # Rebuild vectors for loaded chunks
-                self.chunk_vectors = []
-                for chunk in self.chunks:
-                    full_text = f"{chunk.title} {chunk.section} {chunk.content} {' '.join(chunk.keywords)}"
-                    self.chunk_vectors.append(self._build_tfidf_vector(full_text))
-            except Exception as e:
-                print(f"Warning: could not load vector index: {e}")
-                self.chunks = []
 
 vector_store = VectorStore()

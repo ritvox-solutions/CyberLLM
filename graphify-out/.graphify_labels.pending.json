@@ -1,0 +1,22 @@
+{
+  "0": "User",
+  "1": "chat_routes.py",
+  "2": "App.jsx",
+  "3": "sop_routes.py",
+  "4": "SOPManager",
+  "5": "VectorStore",
+  "6": "package.json",
+  "7": "rag_engine.py",
+  "8": "Implementation Plan: Chat Interface with RAG Tool for Smart Threat Response Assistant",
+  "9": "EmbeddingService",
+  "10": "auth_service.py",
+  "11": ".oxlintrc.json",
+  "12": "React + Vite",
+  "13": "backend/main.py",
+  "14": "backend/README.md",
+  "15": "backend",
+  "16": "api/__init__.py",
+  "17": "app/__init__.py",
+  "18": "models/__init__.py",
+  "19": "Settings"
+}

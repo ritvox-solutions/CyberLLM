@@ -1,33 +1,76 @@
 import os
-from pydantic_settings import BaseSettings
+import secrets
+from functools import cached_property
+from typing import List
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "Smart Threat Response Assistant (SOP + LLM)"
+    """Environment-driven application settings."""
+
+    model_config = SettingsConfigDict(
+        env_file=os.path.join(_BACKEND_DIR, ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=True,
+    )
+
+    PROJECT_NAME: str = "SOC Agent (RAG + SOP Tools)"
     API_V1_STR: str = "/api/v1"
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "super-secret-soc-analyst-key-change-in-prod-2026")
+    VERSION: str = "1.0.0"
+
+    # --- Security -----------------------------------------------------------
+    SECRET_KEY: str = ""
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 # 24 hours
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
-    # LLM Settings
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    # --- CORS ---------------------------------------------------------------
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
-    # NVIDIA NIM Settings
-    NIM_API_KEY: str = os.getenv("NIM_API_KEY", "")
-    NIM_BASE_URL: str = os.getenv("NIM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    NIM_MODEL: str = os.getenv("NIM_MODEL", "meta/llama-4-scout-17b-16e-instruct")
-    
-    # Storage Paths
-    BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # --- LLM provider -------------------------------------------------------
+    LLM_PROVIDER: str = "auto"  # auto | openai | nim | none
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    NVIDIA_API_KEY: str = ""
+    NIM_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    NIM_MODEL: str = "meta/muse-glimmer-30b"
+    LLM_TIMEOUT_SECONDS: float = 25.0
+
+    # --- RAG / embeddings ---------------------------------------------------
+    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_CACHE_DIR: str = os.path.join(_BACKEND_DIR, "data", "huggingface")
+    RETRIEVAL_TOP_K: int = 4
+
+    # --- Database -----------------------------------------------------------
+    DATABASE_URL: str = ""  # empty => SQLite at backend/data/soc.db
+
+    # --- Storage paths ------------------------------------------------------
+    BASE_DIR: str = _BACKEND_DIR
     DATA_DIR: str = os.path.join(BASE_DIR, "data")
     SOPS_DIR: str = os.path.join(DATA_DIR, "sops")
-    INDEX_FILE: str = os.path.join(DATA_DIR, "vector_index.json")
-    ALERTS_FILE: str = os.path.join(DATA_DIR, "alerts.json")
-    AUDIT_FILE: str = os.path.join(DATA_DIR, "audit_chain.json")
+    FAISS_INDEX_FILE: str = os.path.join(DATA_DIR, "faiss.index")
 
-    class Config:
-        case_sensitive = True
+    # --- Seed demo accounts -------------------------------------------------
+    SEED_ADMIN_PASSWORD: str = "adminpassword123"
+    SEED_ANALYST_PASSWORD: str = "socpassword123"
+
+    @cached_property
+    def effective_secret_key(self) -> str:
+        if self.SECRET_KEY.strip():
+            return self.SECRET_KEY
+        return secrets.token_urlsafe(48)
+
+    @cached_property
+    def effective_database_url(self) -> str:
+        if self.DATABASE_URL.strip():
+            return self.DATABASE_URL
+        return "sqlite:///" + os.path.join(self.DATA_DIR, "soc.db").replace("\\", "/")
+
 
 settings = Settings()
 os.makedirs(settings.DATA_DIR, exist_ok=True)
 os.makedirs(settings.SOPS_DIR, exist_ok=True)
+os.makedirs(settings.EMBEDDING_CACHE_DIR, exist_ok=True)
